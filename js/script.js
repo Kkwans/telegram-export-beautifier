@@ -108,7 +108,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // 第二步：自动为标题添加背景装饰
     addHeaderBgDots();
 
-    // 第三步：转换日期格式
+    // 第三步：转换日期格式，替换src'#'字符
     convertDates();
 
     // 第四步：重新组织消息，将joined消息合并到主消息中
@@ -853,6 +853,16 @@ function convertDates() {
                 dateElement.textContent = `${year}-${month}-${day}`;
                 dateElement.setAttribute('data-date', `${year}-${month}-${day}`);
             }
+        }
+    });
+    //将 # 替换为 %23
+    const animated = document.querySelectorAll('.animated');
+    animated.forEach(el => {
+        const originalSrc = el.src;
+        if (originalSrc && originalSrc.includes('#')) {
+            // 将 # 替换为 %23
+            const newSrc = originalSrc.replace(/#/g, '%23');
+            el.src = newSrc;
         }
     });
 }
