@@ -15,6 +15,7 @@ let mediaFilterMode = 'all';  // 媒体筛选模式：'all' | 'image' | 'video'
 let isMediaSwitching = false; // 媒体切换动画中标志（禁止关闭灯箱）
 let userZoomTransition = false; // 用户双击缩放动画保护标志
 let isVideoFullscreen = false;   // 视频是否全屏状态（隔离网页操作）
+let _fsChangeHandler = null;     // 全屏事件监听器引用（灯箱关闭时清理）
 let lightboxOpenTime = 0;        // 灯箱打开时间戳（防止移动端双击误触立即关闭）
 
 // 标签导航相关
@@ -23,6 +24,17 @@ let currentCategory = null;   // 当前选中的标签名
 
 // 媒体尺寸缓存（用于滑动预览精确匹配灯箱显示尺寸）
 const mediaSizeCache = {};
+
+/** 停止容器内所有视频播放（防止innerHTML清除后声音继续） */
+function stopAllVideos(container) {
+    if (!container) return;
+    const videos = container.querySelectorAll('video');
+    videos.forEach(v => {
+        v.pause();
+        v.removeAttribute('src');
+        v.load();
+    });
+}
 
 /** 预加载指定媒体的尺寸信息到缓存，返回Promise */
 function preloadMediaSize(mediaItem) {
@@ -38,16 +50,23 @@ function preloadMediaSize(mediaItem) {
             img.onerror = resolve;
             img.src = mediaItem.src;
         } else if (mediaItem.type === 'video') {
+            // 轻量预加载视频metadata（仅获取尺寸，不下载视频数据）
+            let resolved = false;
+            const done = () => { if (resolved) return; resolved = true; resolve(); };
             const video = document.createElement('video');
             video.preload = 'metadata';
-            video.onloadedmetadata = function() {
-                mediaSizeCache[mediaItem.src] = { width: video.videoWidth, height: video.videoHeight };
-                resolve();
-            };
-            video.onerror = resolve;
-            // 3秒超时，避免网络慢时阻塞
-            setTimeout(resolve, 3000);
+            video.addEventListener('loadedmetadata', function() {
+                if (video.videoWidth && video.videoHeight) {
+                    mediaSizeCache[mediaItem.src] = { width: video.videoWidth, height: video.videoHeight };
+                }
+                video.removeAttribute('src');
+                video.load();
+                done();
+            }, { once: true });
+            video.addEventListener('error', function() { done(); }, { once: true });
             video.src = mediaItem.src;
+            // 2秒超时：避免metadata加载过久阻塞
+            setTimeout(() => { if (!resolved) { video.removeAttribute('src'); video.load(); } done(); }, 2000);
         } else {
             resolve();
         }
@@ -82,7 +101,7 @@ function calcMediaDisplaySize(mediaItem) {
     const maxW = vp.width * (mobile ? 0.96 : 0.95);
     const maxH = vp.height * (mobile ? 0.88 : 0.95);
     const ratio = Math.min(maxW / cached.width, maxH / cached.height, 1);
-    return { width: Math.round(cached.width * ratio), height: Math.round(cached.height * ratio) };
+    return { width: Math.floor(cached.width * ratio), height: Math.floor(cached.height * ratio) };
 }
 
 // ==================== 初始化入口 ====================
@@ -138,27 +157,107 @@ document.addEventListener('DOMContentLoaded', function () {
     // 第十二步：创建滚动至顶部/底部按钮
     createScrollButtons();
 
-    // 最后：标记页面初始化完成，等待最低1秒后淡出遮罩再显示内容
-    const elapsed = Date.now() - loadingStartTime;
-    const minDisplayTime = 1000;
-    const remainingTime = Math.max(0, minDisplayTime - elapsed);
+    // 第十三步：检测并美化加载失败的媒体卡片
+    handleBrokenImages();
 
-    setTimeout(() => {
-        // 先让page_wrap可见（但被遮罩盖住，用户看不到）
+    // 第十四步：监听页面可见性，锁屏恢复后重建GPU纹理
+    setupVisibilityHandler();
+
+    // 最后：等待加载完成后淡出遮罩
+    const fadeOutOverlay = () => {
         document.body.classList.add('page-ready');
-        // 强制重排确保page_wrap已渲染完毕
         void document.body.offsetHeight;
-        // 淡出遮罩
         requestAnimationFrame(() => {
             loadingOverlay.classList.add('fade-out');
-            // 淡出动画结束后移除遮罩DOM
             setTimeout(() => {
                 if (loadingOverlay.parentNode) {
                     loadingOverlay.parentNode.removeChild(loadingOverlay);
                 }
             }, 600);
         });
-    }, remainingTime);
+    };
+
+    if (isMobileDevice()) {
+        // 移动端：至少显示1秒（动画完整展示），同时等待缩略图加载（80%阈值提前放行），3.5秒超时（对齐加载条动画周期）
+        const thumbImages = Array.from(document.querySelectorAll('.photo_wrap img, .video_file_wrap img'));
+        const pendingImages = thumbImages.filter(img => !img.complete || img.naturalWidth === 0);
+        let mobileResolved = false;
+        const mobileResolve = (isTimeout) => {
+            if (mobileResolved) return;
+            mobileResolved = true;
+            if (isTimeout) {
+                const loadingText = loadingOverlay.querySelector('.loading-text');
+                if (loadingText) {
+                    loadingText.textContent = '加载超时，部分内容可能未完全加载';
+                    loadingText.style.color = 'rgba(102, 126, 234, 0.6)';
+                    loadingText.style.fontSize = '0.78rem';
+                }
+                setTimeout(fadeOutOverlay, 1000);
+            } else {
+                const elapsed = Date.now() - loadingStartTime;
+                setTimeout(fadeOutOverlay, Math.max(0, 1000 - elapsed));
+            }
+        };
+        if (pendingImages.length === 0) {
+            mobileResolve(false);
+        } else {
+            let mobileLoaded = 0;
+            const mobileThreshold = Math.ceil(pendingImages.length * 0.8);
+            const onMobileImgDone = () => {
+                mobileLoaded++;
+                if (mobileLoaded >= pendingImages.length || mobileLoaded >= mobileThreshold) mobileResolve(false);
+            };
+            pendingImages.forEach(img => {
+                if (img.complete) { onMobileImgDone(); return; }
+                img.addEventListener('load', onMobileImgDone, { once: true });
+                img.addEventListener('error', onMobileImgDone, { once: true });
+            });
+            setTimeout(() => mobileResolve(true), 3500);
+        }
+    } else {
+        // PC端：等待缩略图加载完成（本地文件加载快），80%阈值提前放行，3.5秒超时（对齐加载条动画周期）
+        const thumbImages = Array.from(document.querySelectorAll('.photo_wrap img, .video_file_wrap img'));
+        const pendingImages = thumbImages.filter(img => !img.complete || img.naturalWidth === 0);
+
+        if (pendingImages.length === 0) {
+            const elapsed = Date.now() - loadingStartTime;
+            setTimeout(fadeOutOverlay, Math.max(0, 1000 - elapsed));
+        } else {
+            let resolved = false;
+            const resolve = (isTimeout) => {
+                if (resolved) return;
+                resolved = true;
+                if (isTimeout) {
+                    const loadingText = loadingOverlay.querySelector('.loading-text');
+                    if (loadingText) {
+                        loadingText.textContent = '加载超时，部分内容可能未完全加载';
+                        loadingText.style.color = 'rgba(102, 126, 234, 0.6)';
+                        loadingText.style.fontSize = '0.78rem';
+                    }
+                    setTimeout(fadeOutOverlay, 1000);
+                } else {
+                    const elapsed = Date.now() - loadingStartTime;
+                    setTimeout(fadeOutOverlay, Math.max(0, 1000 - elapsed));
+                }
+            };
+
+            let loadedCount = 0;
+            const totalPending = pendingImages.length;
+            const threshold = Math.ceil(totalPending * 0.8);
+            const onImageDone = () => {
+                loadedCount++;
+                if (loadedCount >= totalPending || loadedCount >= threshold) resolve(false);
+            };
+
+            pendingImages.forEach(img => {
+                if (img.complete) { onImageDone(); return; }
+                img.addEventListener('load', onImageDone, { once: true });
+                img.addEventListener('error', onImageDone, { once: true });
+            });
+
+            setTimeout(() => resolve(true), 3500);
+        }
+    }
 });
 
 // ==================== 灯箱模块 ====================
@@ -634,13 +733,25 @@ function createLightboxIfNeeded() {
                             swipeLoadingEl.style.transition = 'none';
                             swipeLoadingEl.style.opacity = '0';
                         }
+                        // 将swipeContainer从content移到lightbox层级保留（防止showMedia的innerHTML=''销毁预览图导致闪烁）
+                        const savedSwipe = swipeContainer;
+                        if (savedSwipe && savedSwipe.parentNode) {
+                            const lbEl = document.getElementById('lightbox');
+                            if (lbEl) lbEl.appendChild(savedSwipe);
+                        }
                         changeMedia(direction);
-                        preloadAdjacentMediaSizes();
+                        // 视频优先：当前是视频时延迟预加载（canplay后由视频代码触发）
+                        const swMedia = filteredMediaItems[currentIndex];
+                        if (!swMedia || swMedia.type !== 'video') preloadAdjacentMediaSizes();
                         // 等新图片解码/视频渲染后再移除swipeContainer并解锁
                         const newContentEl = document.getElementById('lightbox-content');
                         const newImg = newContentEl ? newContentEl.querySelector('img') : null;
                         const finishSwitch = () => {
-                            removeSwipeContainer();
+                            if (savedSwipe && savedSwipe.parentNode) savedSwipe.remove();
+                            swipeContainer = null;
+                            isSwiping = false;
+                            swipeCurrentX = 0;
+                            swipeDirection = 0;
                             isMediaSwitching = false;
                         };
                         if (newImg && newImg.decode) {
@@ -1071,8 +1182,10 @@ function openLightbox(index) {
     const thumbRect = (!isMobile && thumbEl) ? thumbEl.getBoundingClientRect() : null;
 
     const contentEl = document.getElementById('lightbox-content');
-    // 预加载相邻媒体尺寸（用于滑动预览精确匹配）
-    preloadAdjacentMediaSizes();
+    // 预加载相邻媒体尺寸（视频优先：当前是视频时延迟预加载，避免抢占视频带宽）
+    if (!targetMedia || targetMedia.type !== 'video') {
+        preloadAdjacentMediaSizes();
+    }
 
     // 立即调用showMedia，不等待任何异步加载
     showMedia();
@@ -1173,6 +1286,15 @@ function closeLightbox() {
     isMediaSwitching = false;
     userZoomTransition = false;
     isVideoFullscreen = false;
+    // 清理全屏事件监听器
+    if (_fsChangeHandler) {
+        document.removeEventListener('fullscreenchange', _fsChangeHandler);
+        document.removeEventListener('webkitfullscreenchange', _fsChangeHandler);
+        _fsChangeHandler = null;
+    }
+    // 清理全屏过渡遮罩和自定义全屏按钮（挂在lightbox/body上，不会被content.innerHTML清掉）
+    document.querySelectorAll('.fs-transition-mask').forEach(m => m.remove());
+    document.querySelectorAll('.custom-fs-btn').forEach(m => m.remove());
 
     // 清理滑动容器（如果存在）
     const swipeEl = content ? content.querySelector('.swipe-container') : null;
@@ -1218,6 +1340,7 @@ function closeLightbox() {
             window.scrollTo(0, savedScrollY);
         }
         mediaFilterMode = 'all';
+        stopAllVideos(content);
         content.innerHTML = '';
         seekIndicatorElement = null;
         currentImage = null;
@@ -1244,9 +1367,12 @@ function showMedia() {
     // 根据当前媒体类型动态更新筛选按钮
     updateFilterButtons(media.type);
 
-    // 清空之前的内容（同步重置seek指示器引用）
+    // 清空之前的内容（先停止视频播放防止声音泄漏，再清DOM）
+    stopAllVideos(content);
     content.innerHTML = '';
     seekIndicatorElement = null;
+    // 清理可能残留在灯箱层级的自定义全屏按钮
+    document.querySelectorAll('.custom-fs-btn').forEach(m => m.remove());
 
     if (media.type === 'image') {
         const img = document.createElement('img');
@@ -1281,9 +1407,6 @@ function showMedia() {
         let imgLoadHandled = false;
         let loadingTimer = null;
 
-        // 后台用new Image加载原图（不中断当前img的显示）
-        const bgLoader = new Image();
-
         const removeLoading = () => {
             const ld = content.querySelector('.lightbox-loading');
             if (ld) ld.remove();
@@ -1301,6 +1424,26 @@ function showMedia() {
                 loadingEl.innerHTML = '<div class="lightbox-spinner"></div>';
                 content.appendChild(loadingEl);
             }
+        };
+
+        const showProgressLoading = (pct) => {
+            let loadingEl = content.querySelector('.lightbox-loading');
+            if (!loadingEl) {
+                loadingEl = document.createElement('div');
+                loadingEl.className = 'lightbox-loading';
+                content.appendChild(loadingEl);
+            }
+            if (!loadingEl.querySelector('.lightbox-progress-ring')) {
+                loadingEl.innerHTML = '<svg class="lightbox-progress-ring" viewBox="0 0 44 44" width="44" height="44">' +
+                    '<circle cx="22" cy="22" r="18" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="3"/>' +
+                    '<circle class="progress-bar" cx="22" cy="22" r="18" fill="none" stroke="rgba(255,255,255,0.85)" stroke-width="3" stroke-linecap="round" stroke-dasharray="113.1" stroke-dashoffset="113.1" transform="rotate(-90 22 22)"/>' +
+                    '<text x="22" y="23" text-anchor="middle" dominant-baseline="central" fill="rgba(255,255,255,0.9)" font-size="11">0%</text>' +
+                    '</svg>';
+            }
+            const bar = loadingEl.querySelector('.progress-bar');
+            const text = loadingEl.querySelector('text');
+            if (bar) bar.setAttribute('stroke-dashoffset', String(113.1 * (1 - pct)));
+            if (text) text.textContent = Math.round(pct * 100) + '%';
         };
 
         // 事件绑定（在img创建后立即绑定，不等onload）
@@ -1344,48 +1487,187 @@ function showMedia() {
         if (isOrigCached) {
             // 原图已缓存：直接显示原图，不显示缩略图也不显示loading
             img.src = media.src;
+            if (img.decode) img.decode().catch(() => {});
             imgLoadHandled = true;
             restoreBorder();
         } else if (hasThumb) {
-            // 有缩略图：先显示缩略图预览，后台同时加载原图
+            // 有缩略图：先显示缩略图预览，后台加载原图
             img.src = thumbFallbackSrc;
-            restoreBorder(); // 缩略图有画面，立即显示边框
-            bgLoader.onload = function() {
-                if (imgLoadHandled) return;
-                imgLoadHandled = true;
-                if (loadingTimer) clearTimeout(loadingTimer);
-                img.src = bgLoader.src;
-                removeLoading();
-            };
-            bgLoader.onerror = function() {
-                if (imgLoadHandled) return;
-                // 原图加载失败，保留缩略图，移除loading
-                imgLoadHandled = true;
-                if (loadingTimer) clearTimeout(loadingTimer);
-                removeLoading();
-            };
-            bgLoader.src = media.src;
+            if (img.decode) img.decode().catch(() => {});
 
-            // 100ms后如果原图还没好，显示loading（缩略图已经在显示了）
-            loadingTimer = setTimeout(() => {
-                if (imgLoadHandled) return;
-                showLoading();
-            }, 100);
-        } else {
-            // 无缩略图：直接加载原图
-            img.src = media.src;
-            img.onload = function() {
-                if (imgLoadHandled) return;
+            // PC+移动端统一：锁定图片尺寸为原图目标尺寸，消除缩略图→原图的尺寸跳变
+            {
+                let targetW, targetH;
+                const ds = calcMediaDisplaySize(media);
+                if (ds) {
+                    targetW = ds.width;
+                    targetH = ds.height;
+                } else {
+                    // 原图尺寸未缓存时，用缩略图宽高比×灯箱视口约束估算目标尺寸
+                    // 不设ratio上限1（允许放大），因为缩略图与原图宽高比一致，放大后的尺寸=原图的灯箱显示尺寸
+                    const thumbEl = media.element ? media.element.querySelector('img') : null;
+                    if (thumbEl && thumbEl.naturalWidth && thumbEl.naturalHeight) {
+                        const vp = getLightboxViewport();
+                        const mobile = isMobileDevice();
+                        const maxW = vp.width * (mobile ? 0.96 : 0.95);
+                        const maxH = vp.height * (mobile ? 0.88 : 0.95);
+                        const ratio = Math.min(maxW / thumbEl.naturalWidth, maxH / thumbEl.naturalHeight);
+                        targetW = Math.floor(thumbEl.naturalWidth * ratio);
+                        targetH = Math.floor(thumbEl.naturalHeight * ratio);
+                    }
+                }
+                if (targetW && targetH) {
+                    img.style.width = targetW + 'px';
+                    img.style.height = targetH + 'px';
+                    img.style.objectFit = 'contain';
+                }
+            }
+
+            restoreBorder();
+
+            // 用fetch加载原图（支持真实下载进度显示）
+            let fetchProgress = 0;
+            let hasFetchProgress = false;
+
+            fetch(media.src).then(response => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                const cl = response.headers.get('Content-Length');
+                const total = cl ? parseInt(cl, 10) : 0;
+                if (total > 0 && response.body && typeof response.body.getReader === 'function') {
+                    const reader = response.body.getReader();
+                    let loaded = 0;
+                    const chunks = [];
+                    const pump = () => reader.read().then(({ done, value }) => {
+                        if (done) return;
+                        if (imgLoadHandled || !img.parentNode) { reader.cancel(); return; }
+                        chunks.push(value);
+                        loaded += value.length;
+                        fetchProgress = loaded / total;
+                        hasFetchProgress = true;
+                        const ldEl = content.querySelector('.lightbox-loading');
+                        if (ldEl) showProgressLoading(fetchProgress);
+                        return pump();
+                    });
+                    return pump().then(() => new Blob(chunks, { type: response.headers.get('Content-Type') || '' }));
+                }
+                return response.blob();
+            }).then(blob => {
+                if (imgLoadHandled || !img.parentNode) return;
                 imgLoadHandled = true;
                 if (loadingTimer) clearTimeout(loadingTimer);
-                removeLoading();
-                restoreBorder();
-            };
-            // 100ms后如果原图还没好，显示loading
+                const blobUrl = URL.createObjectURL(blob);
+                const sizeImg = new Image();
+                sizeImg.onload = () => {
+                    if (sizeImg.naturalWidth && sizeImg.naturalHeight) {
+                        mediaSizeCache[media.src] = { width: sizeImg.naturalWidth, height: sizeImg.naturalHeight };
+                    }
+                    img.style.width = '';
+                    img.style.height = '';
+                    img.style.objectFit = '';
+                    img.src = blobUrl;
+                    if (img.decode) img.decode().catch(() => {});
+                    removeLoading();
+                    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+                };
+                sizeImg.onerror = () => { URL.revokeObjectURL(blobUrl); removeLoading(); };
+                sizeImg.src = blobUrl;
+            }).catch(() => {
+                if (imgLoadHandled || !img.parentNode) return;
+                const fallback = new Image();
+                fallback.onload = () => {
+                    if (imgLoadHandled || !img.parentNode) return;
+                    imgLoadHandled = true;
+                    if (loadingTimer) clearTimeout(loadingTimer);
+                    if (fallback.naturalWidth && fallback.naturalHeight) {
+                        mediaSizeCache[media.src] = { width: fallback.naturalWidth, height: fallback.naturalHeight };
+                    }
+                    img.style.width = '';
+                    img.style.height = '';
+                    img.style.objectFit = '';
+                    img.src = fallback.src;
+                    if (img.decode) img.decode().catch(() => {});
+                    removeLoading();
+                };
+                fallback.onerror = () => {
+                    if (imgLoadHandled) return;
+                    imgLoadHandled = true;
+                    if (loadingTimer) clearTimeout(loadingTimer);
+                    removeLoading();
+                };
+                fallback.src = media.src;
+            });
+
+            // 300ms后如果原图还没好，显示loading（有进度信息时显示圆环，否则显示spinner）
             loadingTimer = setTimeout(() => {
                 if (imgLoadHandled) return;
-                showLoading();
-            }, 100);
+                if (hasFetchProgress) {
+                    showProgressLoading(fetchProgress);
+                } else {
+                    showLoading();
+                }
+            }, 300);
+        } else {
+            // 无缩略图：用fetch加载原图（支持进度显示）
+            let fetchProgress2 = 0;
+            let hasFetchProgress2 = false;
+
+            fetch(media.src).then(response => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                const cl = response.headers.get('Content-Length');
+                const total = cl ? parseInt(cl, 10) : 0;
+                if (total > 0 && response.body && typeof response.body.getReader === 'function') {
+                    const reader = response.body.getReader();
+                    let loaded = 0;
+                    const chunks = [];
+                    const pump = () => reader.read().then(({ done, value }) => {
+                        if (done) return;
+                        if (imgLoadHandled || !img.parentNode) { reader.cancel(); return; }
+                        chunks.push(value);
+                        loaded += value.length;
+                        fetchProgress2 = loaded / total;
+                        hasFetchProgress2 = true;
+                        const ldEl = content.querySelector('.lightbox-loading');
+                        if (ldEl) showProgressLoading(fetchProgress2);
+                        return pump();
+                    });
+                    return pump().then(() => new Blob(chunks, { type: response.headers.get('Content-Type') || '' }));
+                }
+                return response.blob();
+            }).then(blob => {
+                if (imgLoadHandled || !img.parentNode) return;
+                imgLoadHandled = true;
+                if (loadingTimer) clearTimeout(loadingTimer);
+                const blobUrl = URL.createObjectURL(blob);
+                img.src = blobUrl;
+                img.onload = () => {
+                    if (img.naturalWidth && img.naturalHeight) {
+                        mediaSizeCache[media.src] = { width: img.naturalWidth, height: img.naturalHeight };
+                    }
+                    removeLoading();
+                    restoreBorder();
+                    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+                };
+            }).catch(() => {
+                if (imgLoadHandled || !img.parentNode) return;
+                img.src = media.src;
+                img.onload = function() {
+                    if (imgLoadHandled) return;
+                    imgLoadHandled = true;
+                    if (loadingTimer) clearTimeout(loadingTimer);
+                    removeLoading();
+                    restoreBorder();
+                };
+            });
+
+            // 300ms后如果原图还没好，显示loading（有进度信息时显示圆环，否则显示spinner）
+            loadingTimer = setTimeout(() => {
+                if (imgLoadHandled) return;
+                if (hasFetchProgress2) {
+                    showProgressLoading(fetchProgress2);
+                } else {
+                    showLoading();
+                }
+            }, 300);
         }
 
         // 图片加载失败：兜底处理
@@ -1417,6 +1699,7 @@ function showMedia() {
             preloadVideo.preload = 'auto';
             preloadVideo.setAttribute('playsinline', '');
             preloadVideo.setAttribute('webkit-playsinline', '');
+            preloadVideo.setAttribute('fetchpriority', 'high');
 
             // poster来源：优先用thumb，网络异常时用DOM中已渲染的缩略图
             const domVideoThumb = media.element ? media.element.querySelector('img') : null;
@@ -1432,12 +1715,14 @@ function showMedia() {
             } else {
                 // 无缓存尺寸：绝不显示poster（避免尺寸跳变），wrapper无边框无阴影，只保留最小尺寸给播放按钮定位
                 preloadVideo.style.cssText = 'width:0;height:0;display:block;pointer-events:none;box-shadow:none;border-radius:0;';
-                wrapper.style.cssText = 'position:relative;display:flex;align-items:center;justify-content:center;max-width:95vw;max-height:95vh;min-width:120px;min-height:120px;overflow:hidden;';
+                wrapper.style.cssText = 'position:relative;display:flex;align-items:center;justify-content:center;max-width:95vw;max-height:95vh;min-width:120px;min-height:120px;border-radius:20px;overflow:hidden;';
             }
             wrapper.appendChild(preloadVideo);
 
             // 设置视频src（在poster设置好之后，避免poster被清空）
             preloadVideo.src = media.src;
+            // 视频canplay后再预加载相邻媒体（避免抢占视频带宽）
+            preloadVideo.addEventListener('canplay', () => { preloadAdjacentMediaSizes(); }, { once: true });
 
             // 视频元数据加载后用精确宽高更新尺寸
             preloadVideo.addEventListener('loadedmetadata', function() {
@@ -1505,27 +1790,68 @@ function showMedia() {
                     preloadVideo.style.cursor = 'default';
                     currentImage = preloadVideo;
                     preloadVideo.addEventListener('wheel', handleWheel, { passive: false });
-                    // 全屏事件：瞬间切换样式（transition:none避免白条闪烁）
-                    const handleFsChange = () => {
-                        const isFull = !!(document.fullscreenElement || document.webkitFullscreenElement);
-                        isVideoFullscreen = isFull;
-                        // 瞬间切换，不要过渡动画
-                        wrapper.style.transition = 'none';
-                        if (isFull) {
-                            wrapper.style.borderRadius = '0';
-                            wrapper.style.boxShadow = 'none';
-                            wrapper.style.overflow = 'visible';
+
+                    // === wrapper全屏方案（消除Via浏览器全屏位置跳动） ===
+                    // 层1: monkey-patch video的全屏方法，重定向到wrapper全屏
+                    const wrapperFS = (wrapper.requestFullscreen || wrapper.webkitRequestFullscreen || function(){}).bind(wrapper);
+                    if (preloadVideo.requestFullscreen) {
+                        preloadVideo.requestFullscreen = function() { return wrapperFS(); };
+                    }
+                    if (preloadVideo.webkitRequestFullscreen) {
+                        preloadVideo.webkitRequestFullscreen = function() { return wrapperFS(); };
+                    }
+                    if (preloadVideo.webkitEnterFullscreen) {
+                        preloadVideo.webkitEnterFullscreen = function() { return wrapperFS(); };
+                    }
+
+                    // 层2: 自定义全屏按钮（灯箱右下角，不覆盖视频；全屏时动态移入wrapper内部）
+                    const fsBtn = document.createElement('button');
+                    fsBtn.className = 'custom-fs-btn';
+                    const fsSvgEnter = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+                    const fsSvgExit = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>';
+                    fsBtn.innerHTML = fsSvgEnter;
+                    fsBtn.setAttribute('aria-label', '全屏');
+                    // 阻止触摸事件穿透到视频（防止误触唤醒原生控件）
+                    fsBtn.addEventListener('touchstart', (ev) => { ev.stopPropagation(); }, { passive: true });
+                    fsBtn.addEventListener('touchend', (ev) => { ev.stopPropagation(); }, { passive: true });
+                    fsBtn.addEventListener('click', (ev) => {
+                        ev.stopPropagation();
+                        ev.preventDefault();
+                        const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+                        if (fsEl) {
+                            (document.exitFullscreen || document.webkitExitFullscreen || function(){}).call(document);
                         } else {
-                            // 退出全屏：延迟一帧恢复圆角，避免闪烁
-                            requestAnimationFrame(() => {
-                                wrapper.style.borderRadius = '20px';
-                                wrapper.style.boxShadow = '0 20px 60px rgba(0,0,0,0.5),0 0 0 3px rgba(255,255,255,0.1)';
-                                wrapper.style.overflow = 'hidden';
-                            });
+                            wrapperFS();
+                        }
+                    });
+                    // 非全屏状态：按钮挂在灯箱层级（不覆盖视频画面）
+                    const lightboxEl = document.getElementById('lightbox');
+                    if (lightboxEl) lightboxEl.appendChild(fsBtn);
+
+                    // 全屏状态跟踪 + 按钮位置动态切换
+                    if (_fsChangeHandler) {
+                        document.removeEventListener('fullscreenchange', _fsChangeHandler);
+                        document.removeEventListener('webkitfullscreenchange', _fsChangeHandler);
+                    }
+                    _fsChangeHandler = () => {
+                        const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+                        isVideoFullscreen = !!(fsEl && (fsEl === wrapper || fsEl === preloadVideo || (fsEl.contains && fsEl.contains(preloadVideo))));
+                        if (isVideoFullscreen) {
+                            // 进入全屏：按钮移入wrapper（全屏只渲染wrapper子元素）
+                            fsBtn.innerHTML = fsSvgExit;
+                            fsBtn.setAttribute('aria-label', '退出全屏');
+                            wrapper.appendChild(fsBtn);
+                        } else {
+                            // 退出全屏：按钮移回灯箱层级
+                            fsBtn.innerHTML = fsSvgEnter;
+                            fsBtn.setAttribute('aria-label', '全屏');
+                            const lb = document.getElementById('lightbox');
+                            if (lb) lb.appendChild(fsBtn);
                         }
                     };
-                    preloadVideo.addEventListener('fullscreenchange', handleFsChange);
-                    preloadVideo.addEventListener('webkitfullscreenchange', handleFsChange);
+                    document.addEventListener('fullscreenchange', _fsChangeHandler);
+                    document.addEventListener('webkitfullscreenchange', _fsChangeHandler);
+
                     preloadVideo.play().then(() => {
                         setTimeout(() => { preloadVideo.controls = true; }, 300);
                     }).catch(() => { preloadVideo.controls = true; });
@@ -1550,23 +1876,138 @@ function showMedia() {
 
             content.appendChild(wrapper);
         } else {
-            // PC端：直接播放视频
+            // PC端：wrapper+poster+播放按钮外圈转圈loading（与移动端视觉统一），自动播放无controls
+            const wrapper = document.createElement('div');
+            wrapper.className = 'video-preview-wrapper';
+            wrapper.style.cssText = 'position:relative;display:flex;align-items:center;justify-content:center;max-width:95vw;max-height:95vh;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 0 3px rgba(255,255,255,0.1);overflow:hidden;';
+
             const video = document.createElement('video');
+            video.preload = 'auto';
+            video.setAttribute('playsinline', '');
+            video.setAttribute('fetchpriority', 'high');
+
+            const domVideoThumb = media.element ? media.element.querySelector('img') : null;
+            const posterSrc = media.thumb || (domVideoThumb ? domVideoThumb.src : '');
+
+            const videoDisplaySize = calcMediaDisplaySize(media);
+            if (videoDisplaySize) {
+                wrapper.style.width = videoDisplaySize.width + 'px';
+                wrapper.style.height = videoDisplaySize.height + 'px';
+                // poster用wrapper背景显示（不用video.poster），防止浏览器播放开始时移除poster导致首帧未绘制时闪烁
+                if (posterSrc) {
+                    wrapper.style.backgroundImage = 'url("' + posterSrc.replace(/"/g, '\\"') + '")';
+                    wrapper.style.backgroundSize = 'cover';
+                    wrapper.style.backgroundPosition = 'center';
+                }
+                // video初始透明，等playing+双rAF确认首帧已绘制后再显示
+                video.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;pointer-events:none;background:transparent;box-shadow:none;border-radius:0;opacity:0;';
+            } else {
+                video.style.cssText = 'width:0;height:0;display:block;pointer-events:none;box-shadow:none;border-radius:0;';
+                wrapper.style.cssText = 'position:relative;display:flex;align-items:center;justify-content:center;max-width:95vw;max-height:95vh;min-width:120px;min-height:120px;border-radius:20px;overflow:hidden;';
+            }
+            wrapper.appendChild(video);
             video.src = media.src;
-            video.controls = true;
-            video.autoplay = true;
-            video.style.maxWidth = '100%';
-            video.style.maxHeight = '90vh';
-            video.id = 'current-video';
 
-            // 添加视频缩放支持（只缩放，不拖拽）
+            // 视频元数据加载后用精确宽高更新尺寸
+            video.addEventListener('loadedmetadata', function() {
+                const vw = video.videoWidth, vh = video.videoHeight;
+                if (vw && vh) {
+                    mediaSizeCache[media.src] = { width: vw, height: vh };
+                    const ds = calcMediaDisplaySize(media);
+                    if (ds) {
+                        wrapper.style.cssText = 'position:relative;display:flex;align-items:center;justify-content:center;max-width:95vw;max-height:95vh;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 0 3px rgba(255,255,255,0.1);overflow:hidden;';
+                        wrapper.style.width = ds.width + 'px';
+                        wrapper.style.height = ds.height + 'px';
+                        video.style.width = '100%';
+                        video.style.height = '100%';
+                        video.style.objectFit = 'cover';
+                    }
+                    // 更新wrapper背景为poster（不用video.poster，避免播放时poster移除闪烁）
+                    // pcVideoReady时说明视频已在播放，不需要再设背景
+                    if (posterSrc && !wrapper.style.backgroundImage && !pcVideoReady) {
+                        wrapper.style.backgroundImage = 'url("' + posterSrc.replace(/"/g, '\\"') + '")';
+                        wrapper.style.backgroundSize = 'cover';
+                        wrapper.style.backgroundPosition = 'center';
+                    }
+                }
+            });
+
+            // 播放按钮外圈转圈loading（与移动端视觉统一，区分于图片loading）
+            // 初始隐藏，300ms后如果视频仍未播放才淡入显示（避免加载快时闪现）
+            const playBtn = document.createElement('div');
+            playBtn.className = 'video-play-btn';
+            const pcBtnStyle = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;border-radius:50%;color:white;font-size:24px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(0,0,0,0.3);pointer-events:none;z-index:5;';
+            playBtn.innerHTML = '<div style="position:absolute;inset:0;border-radius:50%;border:3px solid rgba(255,255,255,0.15);border-top-color:rgba(255,255,255,0.8);animation:lightboxSpin 0.8s linear infinite;"></div><span style="position:relative;padding-left:3px;">▶</span>';
+            playBtn.style.cssText = pcBtnStyle + 'background:rgba(0,0,0,0.45);backdrop-filter:blur(8px);border:none;opacity:0;transition:opacity 0.15s ease;';
+            wrapper.appendChild(playBtn);
+            // 300ms延迟后才显示loading按钮
+            let pcBtnTimer = setTimeout(() => {
+                if (!pcVideoReady && playBtn.parentNode) playBtn.style.opacity = '1';
+            }, 300);
+
+            // 自动播放逻辑：playing事件确认画面已渲染后移除loading
+            let pcVideoReady = false;
+            const pcFinishLoading = () => {
+                if (pcVideoReady) return;
+                pcVideoReady = true;
+                if (pcBtnTimer) { clearTimeout(pcBtnTimer); pcBtnTimer = null; }
+                if (playBtn.parentNode) playBtn.remove();
+                // 显示视频帧（首帧已绘制），清除wrapper背景poster
+                video.style.opacity = '1';
+                wrapper.style.backgroundImage = '';
+                video.style.pointerEvents = 'auto';
+                video.id = 'current-video';
+                video.style.cursor = 'default';
+                currentImage = video;
+                video.addEventListener('wheel', handleWheel, { passive: false });
+                // 不立即显示controls，等鼠标移入时再显示
+            };
+            // playing事件：确认视频画面已开始渲染，双rAF确保帧已合成绘制后再显示视频
+            video.addEventListener('playing', () => {
+                requestAnimationFrame(() => { requestAnimationFrame(() => { pcFinishLoading(); }); });
+            }, { once: true });
+            // 立即尝试播放（灯箱由用户点击打开，浏览器允许autoplay with sound）
+            video.play().catch(() => {
+                // autoplay被阻止，等canplay后重试
+                video.addEventListener('canplay', () => {
+                    video.play().catch(() => { video.controls = true; });
+                }, { once: true });
+            });
+            // canplay后预加载相邻媒体
+            video.addEventListener('canplay', () => { preloadAdjacentMediaSizes(); }, { once: true });
+            // 5秒超时：强制完成loading并显示controls
+            setTimeout(() => {
+                if (!pcVideoReady) {
+                    pcFinishLoading();
+                    video.controls = true;
+                    video.play().catch(() => {});
+                }
+            }, 5000);
+
+            // 鼠标移入视频区域时显示controls（之后由浏览器原生行为管理显隐）
+            video.addEventListener('mouseenter', () => { video.controls = true; }, { once: true });
+
+            // 视频加载出错
+            video.addEventListener('error', function() {
+                const lb = document.getElementById('lightbox');
+                if (lb && !lb.classList.contains('bg-visible')) lb.classList.add('bg-visible');
+            }, { once: true });
+
             currentImage = video;
-            video.addEventListener('wheel', handleWheel, { passive: false });
 
-            // 设置视频光标样式
-            video.style.cursor = 'default';
+            // PC端视频全屏状态跟踪（防止全屏时关闭灯箱）
+            if (_fsChangeHandler) {
+                document.removeEventListener('fullscreenchange', _fsChangeHandler);
+                document.removeEventListener('webkitfullscreenchange', _fsChangeHandler);
+            }
+            _fsChangeHandler = () => {
+                const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+                isVideoFullscreen = !!(fsEl && (fsEl === wrapper || fsEl === video || (fsEl.contains && fsEl.contains(video))));
+            };
+            document.addEventListener('fullscreenchange', _fsChangeHandler);
+            document.addEventListener('webkitfullscreenchange', _fsChangeHandler);
 
-            content.appendChild(video);
+            content.appendChild(wrapper);
         }
     }
 
@@ -1634,8 +2075,12 @@ function handleWheel(e) {
     }
 }
 
-/** 更新图片/视频的transform样式（平移+缩放） */
+/** 更新图片/视频的transform样式（平移+缩放），缩放时动态启用GPU加速 */
 function updateImageTransform(img) {
+    if (currentScale !== 1 || translateX !== 0 || translateY !== 0) {
+        img.style.willChange = 'transform';
+        img.style.backfaceVisibility = 'hidden';
+    }
     img.style.transform = `translate(${translateX}px, ${translateY}px) scale(${currentScale})`;
     img.style.transformOrigin = 'center center';
 }
@@ -1703,6 +2148,8 @@ function resetZoom() {
         currentImage.classList.remove('zoomed');
         currentImage.style.transform = '';
         currentImage.style.cursor = 'zoom-in';
+        currentImage.style.willChange = '';
+        currentImage.style.backfaceVisibility = '';
     }
     currentScale = 1;
     translateX = 0;
@@ -3414,42 +3861,89 @@ function openCategoryPanel(categoryName) {
 
 // ==================== 分页链接美化 ====================
 
-/** 美化Telegram导出的分页链接（Previous/Next messages → 中文 + SVG箭头 + 现代化样式） */
+/** 美化Telegram导出的分页链接（Previous/Next messages → 中文 + SVG箭头 + 现代化样式）
+ * PC端：在页面顶部和底部各创建一行双按钮（查看更早 | 查看更多）
+ * 移动端：保持原位单按钮样式不变
+ */
 function beautifyPagination() {
-    // SVG箭头：左箭头和右箭头（精心设计的圆角chevron）
     const svgLeft = '<svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>';
     const svgRight = '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>';
 
     const paginationLinks = document.querySelectorAll('a.pagination.block_link');
+    let prevHref = '', nextHref = '', prevFile = '', nextFile = '';
+
     paginationLinks.forEach(link => {
         const text = link.textContent.trim().toLowerCase();
-        const isNext = text.includes('next');
-        const isPrev = text.includes('previous');
-        if (!isNext && !isPrev) return;
-
-        link.className = 'pagination-beautified';
-        link.innerHTML = '';
-
-        const inner = document.createElement('div');
-        inner.className = 'pagination-inner';
-
-        const arrow = document.createElement('span');
-        arrow.className = 'pagination-arrow ' + (isPrev ? 'arrow-left' : 'arrow-right');
-        arrow.innerHTML = isPrev ? svgLeft : svgRight;
-
-        const label = document.createElement('span');
-        label.className = 'pagination-label';
-        label.textContent = isPrev ? '查看更早的消息' : '查看更多消息';
-
-        if (isPrev) {
-            inner.appendChild(arrow);
-            inner.appendChild(label);
-        } else {
-            inner.appendChild(label);
-            inner.appendChild(arrow);
+        if (text.includes('previous')) {
+            prevHref = link.getAttribute('href') || '';
+            prevFile = prevHref.split('/').pop();
+        } else if (text.includes('next')) {
+            nextHref = link.getAttribute('href') || '';
+            nextFile = nextHref.split('/').pop();
         }
-        link.appendChild(inner);
     });
+
+    if (!prevHref && !nextHref) return;
+
+    const isMobile = isMobileDevice();
+
+    if (isMobile) {
+        // 移动端：保持原位单按钮，仅美化样式
+        paginationLinks.forEach(link => {
+            const text = link.textContent.trim().toLowerCase();
+            const isNext = text.includes('next');
+            const isPrev = text.includes('previous');
+            if (!isNext && !isPrev) return;
+
+            link.className = 'pagination-beautified';
+            link.innerHTML = '';
+            const inner = document.createElement('div');
+            inner.className = 'pagination-inner';
+            const arrow = document.createElement('span');
+            arrow.className = 'pagination-arrow ' + (isPrev ? 'arrow-left' : 'arrow-right');
+            arrow.innerHTML = isPrev ? svgLeft : svgRight;
+            const label = document.createElement('span');
+            label.className = 'pagination-label';
+            label.textContent = isPrev ? '查看更早消息' : '查看更多消息';
+            if (isPrev) { inner.appendChild(arrow); inner.appendChild(label); }
+            else { inner.appendChild(label); inner.appendChild(arrow); }
+            link.appendChild(inner);
+        });
+        return;
+    }
+
+    // PC端：创建双按钮行容器，在页面顶部和底部各放一组
+    const createPaginationRow = () => {
+        const row = document.createElement('div');
+        row.className = 'pagination-row';
+
+        if (prevHref) {
+            const prevLink = document.createElement('a');
+            prevLink.href = prevHref;
+            prevLink.className = 'pagination-beautified pagination-prev';
+            prevLink.innerHTML = `<span class="pagination-arrow arrow-left">${svgLeft}</span><span class="pagination-label">更早消息</span>`;
+            row.appendChild(prevLink);
+        }
+        if (nextHref) {
+            const nextLink = document.createElement('a');
+            nextLink.href = nextHref;
+            nextLink.className = 'pagination-beautified pagination-next';
+            nextLink.innerHTML = `<span class="pagination-label">更多消息</span><span class="pagination-arrow arrow-right">${svgRight}</span>`;
+            row.appendChild(nextLink);
+        }
+
+        return row;
+    };
+
+    // 移除原始分页链接
+    paginationLinks.forEach(link => link.remove());
+
+    // 在页面内容区顶部和底部各插入一行分页按钮
+    const pageWrap = document.querySelector('.page_wrap .page_body');
+    if (pageWrap) {
+        pageWrap.insertBefore(createPaginationRow(), pageWrap.firstChild);
+        pageWrap.appendChild(createPaginationRow());
+    }
 }
 
 // ==================== 网页标题替换 ====================
@@ -3487,6 +3981,15 @@ function createScrollButtons() {
     topBtn.addEventListener('click', () => {
         window.scrollTo({ top: 0, behavior: 'smooth' });
     });
+    if (isMobile) {
+        // Via浏览器：点击后强制通过内联样式恢复毛玻璃背景，50ms后移除内联样式还原CSS控制
+        topBtn.addEventListener('touchend', () => {
+            topBtn.style.background = 'rgba(255,255,255,0.35)';
+            topBtn.style.webkitBackdropFilter = 'blur(16px)';
+            topBtn.style.backdropFilter = 'blur(16px)';
+            setTimeout(() => { topBtn.style.background = ''; topBtn.style.webkitBackdropFilter = ''; topBtn.style.backdropFilter = ''; }, 80);
+        }, { passive: true });
+    }
 
     // 底部按钮
     const bottomBtn = document.createElement('button');
@@ -3501,6 +4004,14 @@ function createScrollButtons() {
     bottomBtn.addEventListener('click', () => {
         window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
     });
+    if (isMobile) {
+        bottomBtn.addEventListener('touchend', () => {
+            bottomBtn.style.background = 'rgba(255,255,255,0.35)';
+            bottomBtn.style.webkitBackdropFilter = 'blur(16px)';
+            bottomBtn.style.backdropFilter = 'blur(16px)';
+            setTimeout(() => { bottomBtn.style.background = ''; bottomBtn.style.webkitBackdropFilter = ''; bottomBtn.style.backdropFilter = ''; }, 80);
+        }, { passive: true });
+    }
 
     container.appendChild(topBtn);
     container.appendChild(bottomBtn);
@@ -3544,4 +4055,62 @@ function addFavicon() {
     link.type = 'image/svg+xml';
     link.href = url;
     document.head.appendChild(link);
+}
+
+// ==================== 媒体卡片加载失败占位 ====================
+
+/** 检测并美化加载失败的媒体卡片预览图（裂开图片 → 渐变占位 + 图标） */
+function handleBrokenImages() {
+    const mediaImages = document.querySelectorAll('.photo_wrap img, .video_file_wrap img');
+    mediaImages.forEach(img => {
+        const markBroken = () => {
+            img.classList.add('media-broken');
+            const container = img.closest('.photo_wrap, .video_file_wrap');
+            if (container) container.classList.add('media-load-error');
+        };
+        if (img.complete && img.naturalWidth === 0) {
+            markBroken();
+        } else {
+            img.addEventListener('error', markBroken, { once: true });
+        }
+    });
+}
+
+// ==================== 页面可见性恢复 ====================
+
+/** 监听页面可见性变化，屏幕解锁后强制重建GPU纹理（修复Via浏览器锁屏后媒体卡片灰白/裂图） */
+function setupVisibilityHandler() {
+    if (!isMobileDevice()) return; // 仅移动端需要
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+
+        // 创建全新img元素替换旧元素，先插入DOM再延迟设src，强制全新加载+解码+GPU渲染流程
+        const imgs = document.querySelectorAll('.photo_wrap img, .video_file_wrap img');
+        const pending = [];
+        imgs.forEach(img => {
+            if (img.classList.contains('media-broken')) return;
+            const parent = img.parentNode;
+            if (!parent) return;
+            const src = img.getAttribute('src');
+            if (!src) return;
+
+            const newImg = document.createElement('img');
+            newImg.className = img.className;
+            if (img.getAttribute('alt')) newImg.setAttribute('alt', img.getAttribute('alt'));
+            newImg.addEventListener('error', function() {
+                newImg.classList.add('media-broken');
+                const c = newImg.closest('.photo_wrap, .video_file_wrap');
+                if (c) c.classList.add('media-load-error');
+            }, { once: true });
+            parent.replaceChild(newImg, img);
+            pending.push({ el: newImg, src: src });
+        });
+
+        // 下一帧再设src，确保浏览器已处理DOM插入，启动全新的图片加载周期
+        if (pending.length > 0) {
+            requestAnimationFrame(() => {
+                pending.forEach(item => { item.el.src = item.src; });
+            });
+        }
+    });
 }
